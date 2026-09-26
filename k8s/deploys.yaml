@@ -1,19 +1,20 @@
-# ----------------------------- #
-# Persistent storage for MySQL  #
-# ----------------------------- #
-apiVersion: v1
-kind: PersistentVolumeClaim
-metadata:
-  name: mysql-pvc
-spec:
-  accessModes: ["ReadWriteOnce"]
-  resources:
-    requests:
-      storage: 5Gi
+# ===============================================================
+# Prerequisite (see secret.example.yaml for details):
+#   kubectl create secret generic doc-center-secrets \
+#     --from-literal=mysql-root-password='...' \
+#     --from-literal=mysql-password='...' \
+#     --from-literal=secret-key='...' \
+#     --from-literal=google-client-secret='...' \
+#     --from-literal=database-url='mysql+pymysql://flaskuser:...@mysql/cloud_docs'
+# ===============================================================
 ---
 # ----------------------------- #
 # StatefulSet: MySQL 8          #
 # ----------------------------- #
+# StatefulSet rather than Deployment: MySQL needs a stable network identity and
+# dedicated persistent storage. A StatefulSet also guarantees at most one Pod
+# per ordinal at any time -- a Deployment's maxSurge would let old and new Pods
+# overlap, and two mysqld processes writing the same data files corrupts them.
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
@@ -34,17 +35,26 @@ spec:
           - containerPort: 3306
         env:
           - name: MYSQL_ROOT_PASSWORD
-            value: "root"
+            valueFrom:
+              secretKeyRef: { name: doc-center-secrets, key: mysql-root-password }
           - name: MYSQL_DATABASE
             value: cloud_docs
           - name: MYSQL_USER
             value: flaskuser
           - name: MYSQL_PASSWORD
-            value: flaskpass
-        livenessProbe:  # docker-compose health-check replicated here
+            valueFrom:
+              secretKeyRef: { name: doc-center-secrets, key: mysql-password }
+        resources:
+          requests: { cpu: 250m, memory: 512Mi }
+          limits:   { cpu: "1",  memory: 1Gi }
+        livenessProbe:
           exec: { command: ["mysqladmin","ping","-h","localhost"] }
           initialDelaySeconds: 30
           periodSeconds: 10
+        readinessProbe:
+          exec: { command: ["mysqladmin","ping","-h","localhost"] }
+          initialDelaySeconds: 15
+          periodSeconds: 5
         volumeMounts:
           - name: data
             mountPath: /var/lib/mysql
@@ -65,6 +75,9 @@ kind: Deployment
 metadata:
   name: backend
 spec:
+  # Limited to a single replica for now: sessions live on the local filesystem
+  # and uploaded files live on local disk, so both are state. Scaling out
+  # requires moving sessions to Redis and files to S3/MinIO first.
   replicas: 1
   selector:
     matchLabels: { app: backend }
@@ -72,45 +85,84 @@ spec:
     type: RollingUpdate
     rollingUpdate:
       maxSurge: 1
-      maxUnavailable: 1
+      maxUnavailable: 0   # Start the new Pod and wait for Ready before killing the old one
   template:
     metadata:
       labels: { app: backend }
     spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001       # Matches the appuser created in the Dockerfile
+        runAsGroup: 10001
+        fsGroup: 10001         # Gives mounted volumes this group so non-root can write
       initContainers:
+      # Handles cold-start ordering only. If MySQL restarts while the app is
+      # already running this has long since exited, so real resilience needs
+      # application-level connection retries (SQLAlchemy pool_pre_ping).
       - name: wait-mysql
         image: alpine
         command: ["sh","-c","until nc -z mysql 3306; do echo waiting for mysql; sleep 2; done"]
+        securityContext:
+          runAsNonRoot: true
+          runAsUser: 10001
+          allowPrivilegeEscalation: false
+          capabilities: { drop: ["ALL"] }
+        resources:
+          requests: { cpu: 10m, memory: 16Mi }
+          limits:   { cpu: 50m, memory: 32Mi }
       containers:
       - name: backend
+        # The image tag is overwritten by CD with the git SHA (kubectl set image).
+        # :latest is only a local development default.
         image: ghcr.io/shukkai/doc-backend:latest
+        imagePullPolicy: IfNotPresent
         ports:
           - containerPort: 5001
+        # No command override here on purpose: the Dockerfile CMD (gunicorn, exec
+        # form) applies, which makes the gunicorn master PID 1 so it receives
+        # SIGTERM and can shut down gracefully.
         env:
           - name: DATABASE_URL
-            value: mysql+pymysql://flaskuser:flaskpass@mysql/cloud_docs
+            valueFrom:
+              secretKeyRef: { name: doc-center-secrets, key: database-url }
           - name: SECRET_KEY
-            value: dev-key
-          - name: FLASK_APP
-            value: app.py
-          - name: PYTHONPATH
-            value: /app/backend
+            valueFrom:
+              secretKeyRef: { name: doc-center-secrets, key: secret-key }
+          - name: GOOGLE_CLIENT_SECRET
+            valueFrom:
+              secretKeyRef: { name: doc-center-secrets, key: google-client-secret }
+          # The values below are not secret. GOOGLE_CLIENT_ID is public by design:
+          # it appears in the OAuth URL the browser visits.
           - name: GOOGLE_CLIENT_ID
             value: "805978033938-m7otndcs1j21757dj88spjenaao99ev0.apps.googleusercontent.com"
-          - name: GOOGLE_CLIENT_SECRET
-            value: "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"
           - name: FRONTEND_PORT
             value: "80"
           - name: GOOGLE_REDIRECT_URI
             value: "http://localhost/api/auth/google/callback"
-        command:
-          ["flask","run","--host=0.0.0.0","--port=5001","--with-threads"]
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities: { drop: ["ALL"] }
+          # readOnlyRootFilesystem: true requires moving uploads onto a mounted
+          # volume first, so it stays disabled for now.
+        resources:
+          requests: { cpu: 100m, memory: 256Mi }
+          limits:   { cpu: 500m, memory: 512Mi }
         readinessProbe:
           httpGet:
             path: /
             port: 5001
           initialDelaySeconds: 5
           periodSeconds: 10
+        # TODO: point this at /health/live once the app exposes it (returning 200
+        # without touching the database). A liveness probe must never check an
+        # external dependency -- a brief DB outage would restart every Pod at once.
+        livenessProbe:
+          httpGet:
+            path: /
+            port: 5001
+          initialDelaySeconds: 30
+          periodSeconds: 20
+          failureThreshold: 3
 ---
 # ----------------------------- #
 # Deployment: Front-end (Vue)   #
@@ -120,14 +172,14 @@ kind: Deployment
 metadata:
   name: frontend
 spec:
-  replicas: 1
+  replicas: 2            # Static assets plus a reverse proxy: stateless, safe to scale
   selector:
     matchLabels: { app: frontend }
   strategy:
     type: RollingUpdate
     rollingUpdate:
       maxSurge: 1
-      maxUnavailable: 1
+      maxUnavailable: 0
   template:
     metadata:
       labels: { app: frontend }
@@ -135,18 +187,31 @@ spec:
       containers:
       - name: frontend
         image: ghcr.io/shukkai/doc-backend-frontend:latest
+        imagePullPolicy: IfNotPresent
         ports:
           - containerPort: 80
+        # runAsNonRoot is not set here: the official nginx image needs root to
+        # bind port 80 and write /var/cache/nginx. The proper fix is to switch to
+        # nginxinc/nginx-unprivileged and listen on 8080 instead.
+        securityContext:
+          allowPrivilegeEscalation: false
+        resources:
+          requests: { cpu: 50m,  memory: 64Mi }
+          limits:   { cpu: 200m, memory: 128Mi }
         readinessProbe:
-          httpGet:
-            path: /
-            port: 80
+          httpGet: { path: /, port: 80 }
           initialDelaySeconds: 5
           periodSeconds: 10
+        livenessProbe:
+          httpGet: { path: /, port: 80 }
+          initialDelaySeconds: 15
+          periodSeconds: 20
 ---
 # ----------------------------- #
 # Deployment: phpMyAdmin        #
 # ----------------------------- #
+# Development-only database admin UI. It should not be deployed to production,
+# where it would amount to exposing the database console.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -168,21 +233,30 @@ spec:
           - { name: PMA_HOST, value: mysql }
           - { name: PMA_PORT, value: "3306" }
           - { name: PMA_USER, value: root }
-          - { name: PMA_PASSWORD, value: root }
-          - { name: MYSQL_ROOT_PASSWORD, value: root }
+          - name: PMA_PASSWORD
+            valueFrom:
+              secretKeyRef: { name: doc-center-secrets, key: mysql-root-password }
+          - name: MYSQL_ROOT_PASSWORD
+            valueFrom:
+              secretKeyRef: { name: doc-center-secrets, key: mysql-root-password }
+        resources:
+          requests: { cpu: 50m,  memory: 128Mi }
+          limits:   { cpu: 300m, memory: 256Mi }
         readinessProbe:
           httpGet: { path: /, port: 80 }
           initialDelaySeconds: 5
 ---
 # ----------------------------- #
 # ConfigMaps: Prometheus/Grafana#
-# (created by kubectl beforehand)
 # ----------------------------- #
-# kubectl create configmap prometheus-config --from-file=../prometheus/config.yml
-# kubectl create configmap grafana-datasource --from-file=../grafana/datasource.yaml
-# kubectl create configmap grafana-dashboard  --from-file=../grafana/dashboard.yaml --from-file=../grafana/dashboards/
-# kubectl create configmap grafana-config --from-file=config.ini
-# These placeholders show how they're mounted:
+# Created imperatively by start_k8s.sh:
+#   kubectl create configmap prometheus-config  --from-file=../prometheus/prometheus.yml
+#   kubectl create configmap grafana-datasource --from-file=../grafana/datasource.yaml
+#   kubectl create configmap grafana-dashboard  --from-file=../grafana/dashboard.yaml --from-file=../grafana/dashboards/
+#
+# TODO: replace with declarative manifests or a Kustomize configMapGenerator.
+# As it stands this part of the cluster state is not in version control and
+# cannot be managed by GitOps.
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -201,6 +275,9 @@ spec:
         image: prom/prometheus:v2.53.4
         ports:
           - containerPort: 9090
+        resources:
+          requests: { cpu: 100m, memory: 256Mi }
+          limits:   { cpu: 500m, memory: 1Gi }
         volumeMounts:
           - name: config
             mountPath: /etc/prometheus
@@ -226,6 +303,9 @@ spec:
         image: grafana/grafana:11.5.5
         ports:
           - containerPort: 3000
+        resources:
+          requests: { cpu: 100m, memory: 128Mi }
+          limits:   { cpu: 500m, memory: 512Mi }
         volumeMounts:
           - name: grafana-datasource
             mountPath: /etc/grafana/provisioning/datasources
@@ -233,17 +313,16 @@ spec:
             mountPath: /etc/grafana/provisioning/dashboards
           - name: grafana-dash-files
             mountPath: /var/lib/grafana/dashboards
-          # - name: grafana-config
-          #   mountPath: /etc/grafana/grafana.ini
-          #   subPath: config.ini
-
       volumes:
         - name: grafana-datasource
           configMap: { name: grafana-datasource }
         - name: grafana-dashboard
           configMap: { name: grafana-dashboard }
+        # KNOWN ISSUE (not yet fixed): dashboard.yaml declares its provider path as
+        # /var/lib/grafana/dashboards, but that path is mounted as an empty
+        # emptyDir here, while example.json is flattened by the ConfigMap into
+        # /etc/grafana/provisioning/dashboards. Dashboards therefore do not load
+        # under Kubernetes, although they do under docker compose.
+        # Fix: split into two ConfigMaps mounted at their respective paths.
         - name: grafana-dash-files
-          emptyDir: {}   # dashboards copied from ConfigMap at start-up script if required
-        # - name: grafana-config
-        #   configMap:
-        #     name: grafana-config
+          emptyDir: {}
