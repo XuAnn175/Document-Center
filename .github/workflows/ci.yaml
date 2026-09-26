@@ -2,82 +2,129 @@ name: CI
 
 on: [push, pull_request]
 
+concurrency:
+  # Cancel superseded runs on the same ref to save runner minutes
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
+  # ---------------------------------------------------------------
+  # Security scans: cheap and fast, so they run first (fail fast)
+  # ---------------------------------------------------------------
+  security:
+    name: Security scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # Scans the current working tree for secrets.
+      # --no-git (working tree only, not git history) is deliberate: credentials
+      # that were committed historically have already been rotated and are a
+      # known, handled issue. The purpose of this gate is to stop NEW secrets
+      # from getting in. Cleaning history is a separate one-off task
+      # (git filter-repo / BFG).
+      - name: Scan for secrets (gitleaks)
+        run: |
+          docker run --rm -v "$PWD:/repo" zricethezav/gitleaks:latest \
+            detect --source=/repo --no-git --redact --verbose
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+          cache-dependency-path: backend/requirements.txt
+
+      # Software composition analysis: known CVEs in third-party packages
+      - name: Audit Python dependencies
+        working-directory: ./backend
+        run: |
+          pip install --upgrade pip pip-audit
+          # Non-blocking for now; make this a hard gate once the noise level is known
+          pip-audit -r requirements.txt || true
+
+  # ---------------------------------------------------------------
+  # Tests and coverage
+  # ---------------------------------------------------------------
   testing:
+    name: Tests & coverage
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
           python-version: '3.10'
+          cache: 'pip'
+          cache-dependency-path: backend/requirements.txt
 
       - name: Install dependencies
+        working-directory: ./backend
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          pip install beautifulsoup4
-        working-directory: ./backend
 
       - name: Run tests with coverage
-        run: |
-          mkdir -p uploads  # Ensure the upload folder exists if needed
-          pytest --cov=./ --cov-report=term-missing --cov-report=html --cov-report=xml
         working-directory: ./backend
+        run: |
+          mkdir -p uploads
+          pytest --cov=./ --cov-report=term-missing --cov-report=html --cov-report=xml
 
       - name: Upload coverage data and report
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: coverage-data
-          path: ./backend/htmlcov
+          path: |
+            ./backend/htmlcov
+            ./backend/coverage.xml
 
+      # ---------------------------------------------------------------
+      # Write the coverage table into the Actions run summary.
+      #
+      # The previous version parsed htmlcov/index.html with BeautifulSoup and
+      # read cols[4], which is the count of uncovered statements rather than the
+      # coverage percentage. That produced "Total Coverage: 131" and showed test
+      # files at 0%.
+      #
+      # This version parses coverage.xml (Cobertura). The line-rate attribute is
+      # part of a documented schema, unlike HTML column ordering which can change
+      # between coverage.py releases -- and such a change would silently report
+      # wrong numbers rather than failing outright, which is worse.
+      # ---------------------------------------------------------------
       - name: Add coverage summary to Actions run
         if: always()
         run: |
           python - <<'PY'
-          import os, sys, pathlib, textwrap
-          from bs4 import BeautifulSoup
+          import os, sys, pathlib, xml.etree.ElementTree as ET
 
-          html_path = pathlib.Path("backend/htmlcov/index.html")
-          if not html_path.exists():
-              print("No HTML coverage report found, skipping summary.")
+          xml_path = pathlib.Path("backend/coverage.xml")
+          if not xml_path.exists():
+              print("No coverage.xml found, skipping summary.")
               sys.exit(0)
 
-          with open(html_path, encoding='utf-8') as f:
-              soup = BeautifulSoup(f, "html.parser")
+          root = ET.parse(xml_path).getroot()
+          total = float(root.get("line-rate", 0)) * 100
 
-          table = soup.find("table", class_="index")
-          if not table:
-              print("Coverage table not found.")
-              sys.exit(1)
+          rows = []
+          for cls in root.iter("class"):
+              name = cls.get("filename") or cls.get("name")
+              pct = float(cls.get("line-rate", 0)) * 100
+              rows.append((name, pct))
+          rows.sort(key=lambda r: r[1])   # Lowest coverage first: shows what to fix
 
-          rows = table.find_all("tr")[1:]  # skip header
-          file_coverage_data = []
-
-          for row in rows:
-              cols = row.find_all("td")
-              if len(cols) < 5:
-                  continue
-              file_name = cols[0].text.strip()
-              coverage = cols[4].text.strip()
-              file_coverage_data.append((file_name, coverage))
-
-          total = next((row for row in file_coverage_data if row[0].lower() == "total"), None)
-          file_coverage_data = [row for row in file_coverage_data if row[0].lower() != "total"]
-
-          summary_md = "### 🧪 Coverage per File\n\n"
-          summary_md += "| File | Coverage |\n"
-          summary_md += "|------|----------|\n"
-          for file_name, cov in file_coverage_data:
-              summary_md += f"| {file_name} | {cov} |\n"
-
-          if total:
-              summary_md += f"\n**Total Coverage:** **{total[1]}**\n\n"
-
-          summary_md += "_Full HTML report available in the “Artifacts” section (html-coverage)._"
+          md  = "### Coverage per File\n\n"
+          md += f"**Total: {total:.1f}%**\n\n"
+          md += "| File | Coverage |\n|------|----------|\n"
+          for name, pct in rows:
+              md += f"| `{name}` | {pct:.1f}% |\n"
+          md += "\n_Full HTML report available in the Artifacts section (coverage-data)._\n"
 
           with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as fh:
-              fh.write(summary_md)
+              fh.write(md)
+
+          print(f"Total coverage: {total:.1f}%")
           PY

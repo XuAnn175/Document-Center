@@ -19,3 +19,11 @@ client_secret_*.json
 .coverage
 *.xml
 htmlcov/
+
+# Local interview-prep notes: personal study material, not part of the project
+interview-prep/
+
+# Real K8s Secrets must never be committed (only secret.example.yaml may be)
+k8s/secret.yaml
+k8s/secrets.yaml
+k8s/*-secret.yaml
