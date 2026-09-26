@@ -63,7 +63,11 @@ jobs:
           cache-to: type=gha,mode=max
 
       - name: Scan backend image (Trivy)
-        uses: aquasecurity/trivy-action@0.28.0
+        # Third-party actions are pinned to a commit SHA rather than a tag:
+        # a tag can be moved to point at different code, which is a supply
+        # chain attack vector. First-party actions/* and docker/* are left on
+        # major tags.
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25  # v0.36.0
         with:
           image-ref: ${{ steps.lower_repo.outputs.tag }}:${{ steps.tags.outputs.sha }}
           severity: 'HIGH,CRITICAL'
@@ -85,7 +89,7 @@ jobs:
           cache-to: type=gha,mode=max
 
       - name: Scan frontend image (Trivy)
-        uses: aquasecurity/trivy-action@0.28.0
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25  # v0.36.0
         with:
           image-ref: ${{ steps.lower_repo.outputs.tag }}-frontend:${{ steps.tags.outputs.sha }}
           severity: 'HIGH,CRITICAL'
