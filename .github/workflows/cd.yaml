@@ -45,9 +45,10 @@ jobs:
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
-          # TODO: switch to the built-in GITHUB_TOKEN to avoid maintaining a
-          # long-lived credential.
-          password: ${{ secrets.GHCR_TOKEN }}
+          # The built-in GITHUB_TOKEN is minted per run and expires with it, so
+          # there is no long-lived credential to store, rotate or leak. It can
+          # push to ghcr.io because the job declares packages: write above.
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       # ----------------- Backend -----------------
       - name: Build & push backend image
