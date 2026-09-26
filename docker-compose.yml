@@ -46,10 +46,14 @@ services:
     environment:
       - DATABASE_URL=mysql+pymysql://flaskuser:flaskpass@mysql/cloud_docs
       - SECRET_KEY=dev-key
-      - FLASK_APP=app.py
-      - PYTHONPATH=/app/backend
-    command: >
-      sh -c "flask run --host=0.0.0.0 --port=5001 --with-threads"
+      # app.py uses relative imports, so it must load as a package:
+      # PYTHONPATH points at the PARENT directory of backend/
+      - FLASK_APP=backend.app
+      - PYTHONPATH=/app
+    # Development deliberately keeps the Flask dev server: --debug enables hot
+    # reload, which pairs with the bind mount above. Production uses the
+    # Dockerfile CMD (gunicorn). Array form avoids wrapping in an extra shell.
+    command: ["flask", "run", "--host=0.0.0.0", "--port=5001", "--debug"]
     depends_on:
       mysql:
         condition: service_healthy

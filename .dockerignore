@@ -1,0 +1,40 @@
+# ---------------------------------------------------------------
+# The backend build context is the repository root
+# (cd.yaml: docker build -f backend/Dockerfile ... .)
+# Docker only reads .dockerignore at the context root, so these
+# rules must live here -- not in backend/.dockerignore.
+# ---------------------------------------------------------------
+
+# Secrets: must never be baked into the image
+backend/.env
+backend/.env.*
+!backend/.env.sample
+.env
+
+# Test and coverage artifacts
+backend/tests/
+backend/.pytest_cache/
+backend/htmlcov/
+backend/.coverage
+backend/coverage.xml
+
+# Python bytecode caches (platform/version specific)
+**/__pycache__/
+**/*.py[cod]
+
+# User uploads
+backend/uploads/
+uploads/
+
+# Not needed by the backend image; excluding these shrinks the
+# build context and speeds up the build
+frontend/
+k8s/
+grafana/
+prometheus/
+assets/
+interview-prep/
+.github/
+.git/
+docker-compose.yml
+README.md
