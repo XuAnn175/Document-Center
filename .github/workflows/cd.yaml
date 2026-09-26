@@ -4,9 +4,16 @@ on:
   push:
     branches: [ main ]
 
+concurrency:
+  group: cd-${{ github.ref }}
+  cancel-in-progress: false      # Never cancel a deployment mid-flight
+
 jobs:
   deploy:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
     env:
       IMAGE_REPO: ghcr.io/${{ github.repository_owner }}/doc-backend
 
@@ -14,25 +21,97 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      # GHCR (per the OCI spec) requires lowercase image paths, but
+      # repository_owner preserves the account's original casing.
       - name: Convert image repo to lowercase
         id: lower_repo
+        run: echo "tag=$(echo $IMAGE_REPO | tr '[:upper:]' '[:lower:]')" >> $GITHUB_OUTPUT
+
+      # Immutable tags: the commit SHA makes every running image traceable back
+      # to the exact source it was built from. Publishing only :latest means
+      # Kubernetes sees an unchanged tag and may not re-pull -- the deployment
+      # silently does nothing -- and leaves no specific version to roll back to.
+      - name: Compute image tags
+        id: tags
         run: |
-          echo "tag=$(echo $IMAGE_REPO | tr '[:upper:]' '[:lower:]')" >> $GITHUB_OUTPUT
+          echo "sha=${{ github.sha }}"          >> $GITHUB_OUTPUT
+          echo "short=${GITHUB_SHA::7}"         >> $GITHUB_OUTPUT
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
 
       - name: Log in to GHCR
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
+          # TODO: switch to the built-in GITHUB_TOKEN to avoid maintaining a
+          # long-lived credential.
           password: ${{ secrets.GHCR_TOKEN }}
 
+      # ----------------- Backend -----------------
       - name: Build & push backend image
-        run: |
-          docker build -f backend/Dockerfile -t ${{ steps.lower_repo.outputs.tag }}:latest .
-          docker push ${{ steps.lower_repo.outputs.tag }}:latest
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: backend/Dockerfile
+          push: true
+          tags: |
+            ${{ steps.lower_repo.outputs.tag }}:${{ steps.tags.outputs.sha }}
+            ${{ steps.lower_repo.outputs.tag }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
 
+      - name: Scan backend image (Trivy)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ steps.lower_repo.outputs.tag }}:${{ steps.tags.outputs.sha }}
+          severity: 'HIGH,CRITICAL'
+          ignore-unfixed: true      # Vulnerabilities with no available fix would block forever
+          exit-code: '0'            # Observe first; set to '1' to make this a hard gate
+          format: 'table'
+
+      # ----------------- Frontend -----------------
       - name: Build & push frontend image
-        run: |
-          docker build -f frontend/Dockerfile -t ${{ steps.lower_repo.outputs.tag }}-frontend:latest ./frontend
-          docker push ${{ steps.lower_repo.outputs.tag }}-frontend:latest
+        uses: docker/build-push-action@v6
+        with:
+          context: ./frontend
+          file: frontend/Dockerfile
+          push: true
+          tags: |
+            ${{ steps.lower_repo.outputs.tag }}-frontend:${{ steps.tags.outputs.sha }}
+            ${{ steps.lower_repo.outputs.tag }}-frontend:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
 
+      - name: Scan frontend image (Trivy)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ steps.lower_repo.outputs.tag }}-frontend:${{ steps.tags.outputs.sha }}
+          severity: 'HIGH,CRITICAL'
+          ignore-unfixed: true
+          exit-code: '0'
+          format: 'table'
+
+      - name: Summary
+        run: |
+          {
+            echo "### Published images"
+            echo ""
+            echo '```'
+            echo "${{ steps.lower_repo.outputs.tag }}:${{ steps.tags.outputs.sha }}"
+            echo "${{ steps.lower_repo.outputs.tag }}-frontend:${{ steps.tags.outputs.sha }}"
+            echo '```'
+            echo ""
+            echo "Deploy with:"
+            echo '```bash'
+            echo "kubectl set image deploy/backend  backend=${{ steps.lower_repo.outputs.tag }}:${{ steps.tags.outputs.sha }}"
+            echo "kubectl set image deploy/frontend frontend=${{ steps.lower_repo.outputs.tag }}-frontend:${{ steps.tags.outputs.sha }}"
+            echo "kubectl rollout status deploy/backend"
+            echo '```'
+          } >> $GITHUB_STEP_SUMMARY
+
+      # TODO: this workflow stops after publishing images; deployment is still
+      # manual. Next step is ArgoCD and a GitOps flow, where CD updates the image
+      # tag in the manifests and the in-cluster agent pulls the change -- so
+      # cluster credentials never leave the cluster.
