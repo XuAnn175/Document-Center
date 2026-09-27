@@ -8,6 +8,9 @@ os.environ["DATABASE_URL"] = "sqlite:///:memory:"
 
 # ✅ 正確引入 Flask 應用
 from ..app import app as real_app, db
+from ..redis_client import set_redis
+
+import fakeredis
 
 @pytest.fixture(scope="session")
 def flask_app():
@@ -54,3 +57,16 @@ def _push_request_context():
     """
     yield
 
+
+@pytest.fixture(autouse=True)
+def fake_redis():
+    """Give every test its own in-memory Redis.
+
+    The whole suite runs with rate limiting and caching enabled, as it does
+    in production. A fresh instance per test keeps rate-limit counters and
+    cached entries from leaking between tests that share the same database.
+    """
+    client = fakeredis.FakeRedis(decode_responses=True)
+    set_redis(client)
+    yield client
+    set_redis(None)

@@ -17,6 +17,14 @@ class Config:
     )
     SQLALCHEMY_TRACK_MODIFICATIONS = False
 
+    # Number of reverse proxies in front of the app that append to
+    # X-Forwarded-For. Rate limits key on the client IP, so this must match
+    # the deployment: 1 behind nginx alone (compose), 2 behind an ingress
+    # controller plus nginx (k8s). Set too low and every request is keyed on
+    # a proxy's IP, so one client can lock everyone out; set too high and
+    # clients can choose their own IP by sending the header themselves.
+    TRUSTED_PROXY_COUNT = int(os.getenv("TRUSTED_PROXY_COUNT", "1"))
+
     # Session Configuration for better isolation
     SESSION_COOKIE_NAME = "session"
     SESSION_COOKIE_SAMESITE = "Lax"

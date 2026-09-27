@@ -11,9 +11,10 @@ from flask_login import (
 )
 from werkzeug.utils import secure_filename
 from werkzeug.exceptions import RequestEntityTooLarge
+from werkzeug.middleware.proxy_fix import ProxyFix
 from sqlalchemy import inspect
 from sqlalchemy.exc import OperationalError
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, make_transient_to_detached
 from dotenv import load_dotenv
 from authlib.integrations.flask_client import OAuth
 from prometheus_flask_exporter import PrometheusMetrics
@@ -25,12 +26,25 @@ from .models import (
 )
 from .config import Config
 from .init_db import create_test_user, create_admin_and_test_users
+from .redis_client import (
+    PUBLIC_FILES_KEY, PUBLIC_FILES_TTL, USER_TTL, user_key,
+    cache_get_json, cache_set_json,
+    hit_rate_limit, reset_rate_limit,
+    register_cache_invalidation,
+)
 
 
 # ───────────────────────────── Flask & Login ─────────────────────────────
 app = Flask(__name__)
 app.config.from_object(Config)
 db.init_app(app)
+
+# Behind nginx (and, in k8s, an ingress controller) request.remote_addr is the
+# proxy's address. Rate limits key on the client IP, so recover it from
+# X-Forwarded-For, trusting only as many hops as there are proxies.
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=Config.TRUSTED_PROXY_COUNT)
+
+register_cache_invalidation(File, User)
 
 metrics = PrometheusMetrics(app)  # 啟用自動監控所有 endpoint
 
@@ -64,9 +78,46 @@ google = oauth.register(
     server_metadata_url= 'https://accounts.google.com/.well-known/openid-configuration'
 )
 
+def _user_to_cache(user: User) -> dict:
+    # password_hash is deliberately left out so hashes never sit in Redis.
+    # The few paths that need it (change-password) load it on demand.
+    return {
+        "username":   user.username,
+        "email":      user.email,
+        "grade":      user.grade,
+        "is_admin":   bool(user.is_admin),
+        "created_at": user.created_at.isoformat() if user.created_at else None,
+    }
+
+def _user_from_cache(uid: int, data: dict) -> User:
+    user = User(
+        id=uid,
+        username=data["username"],
+        email=data["email"],
+        grade=data["grade"],
+        is_admin=data["is_admin"],
+        created_at=datetime.fromisoformat(data["created_at"]) if data["created_at"] else None,
+    )
+    # Attach to the session without querying. A plain detached object would
+    # look fine but silently drop writes: current_user.set_password() followed
+    # by commit() would never reach the database. Attributes not cached here
+    # (password_hash) are marked expired and loaded on first access.
+    make_transient_to_detached(user)
+    return db.session.merge(user, load=False)
+
 @login_manager.user_loader
-def load_user(uid):          # SQLAlchemy 2.x: Session.get
-    return db.session.get(User, int(uid))
+def load_user(uid):
+    # Runs on every authenticated request, and the SPA polls /session-status
+    # every 10 s and /notifications every 30 s per open tab, so without a cache
+    # this is a user-table read several times a minute per idle tab.
+    uid = int(uid)
+    cached = cache_get_json(user_key(uid))
+    if cached is not None:
+        return _user_from_cache(uid, cached)
+    user = db.session.get(User, uid)
+    if user is not None:
+        cache_set_json(user_key(uid), _user_to_cache(user), USER_TTL)
+    return user
 
 @login_manager.unauthorized_handler
 def _unauth():
@@ -136,6 +187,20 @@ def _get_content_for_version(db_session: Session, file_obj: File, version_number
     else:
         current_app.logger.warning(f"Content path for file {file_obj.id} V{version_number_to_fetch} not found or does not exist. Path: {content_path}")
         return ""
+
+# ─────────────────────────── rate limits ───────────────────────────
+# (max attempts, window in seconds)
+LOGIN_LIMIT_PER_IP       = (20, 60)
+LOGIN_LIMIT_PER_USERNAME = (5, 300)
+REGISTER_LIMIT_PER_IP    = (10, 3600)
+RESET_LIMIT_PER_IP       = (5, 900)
+RESET_LIMIT_PER_EMAIL    = (3, 3600)
+
+def _too_many_attempts(retry_after: int):
+    resp = jsonify({"error": "Too many attempts. Please try again later."})
+    resp.status_code = 429
+    resp.headers["Retry-After"] = str(retry_after)
+    return resp
 
 # ───────────────────────────────── Routes ─────────────────────────────────
 @app.route('/')
@@ -330,9 +395,7 @@ def get_folders():
     })
 
 # ────────────── Get Public Files ────────────────────────────────────────
-@app.route('/public-files', methods=['GET'])
-@login_required
-def get_all_public_files():
+def _public_files_payload() -> dict:
     all_publics = File.query.filter_by(is_published=True).all()
 
     files_data = []
@@ -353,9 +416,20 @@ def get_all_public_files():
             # }
         })
 
-    return jsonify({
-        "pfiles": files_data,
-    })
+    return {"pfiles": files_data}
+
+@app.route('/public-files', methods=['GET'])
+@login_required
+def get_all_public_files():
+    # Every user sees the same list, and it changes only when a file is
+    # published, unpublished, edited, renamed, moved or deleted, so one shared
+    # entry serves the whole site. Invalidation is automatic: any committed
+    # change to a File row evicts it (see register_cache_invalidation).
+    payload = cache_get_json(PUBLIC_FILES_KEY)
+    if payload is None:
+        payload = _public_files_payload()
+        cache_set_json(PUBLIC_FILES_KEY, payload, PUBLIC_FILES_TTL)
+    return jsonify(payload)
 
 # ────────────── Create / Delete folder ───────────────────────────────────
 @app.route('/folders', methods=['POST'])
@@ -613,6 +687,11 @@ def rename_file(file_id):
 # ────────────── Auth & password flows (unchanged) ───────────────────────
 @app.route('/register', methods=['POST'])
 def register():
+    allowed, retry = hit_rate_limit(f"ratelimit:register:ip:{request.remote_addr}",
+                                    *REGISTER_LIMIT_PER_IP)
+    if not allowed:
+        return _too_many_attempts(retry)
+
     data = request.get_json()
     if not data or not data.get('username') or not data.get('password') or not data.get('email'):
         return jsonify({"message": "Username, email, and password are required"}), 400
@@ -658,9 +737,30 @@ def login():
     
     if not username or not password:
         return {"error": "Username and password required"}, 400
-    
+
+    # Two limits, because each alone is easy to get around: per IP stops one
+    # client guessing across many accounts, per username stops a distributed
+    # attack on one account from many IPs.
+    #
+    # The attempt is counted *before* the password is checked. Counting only
+    # failures means reading the counter first, and a burst of parallel
+    # requests could all read it below the limit before any records a failure.
+    allowed, retry = hit_rate_limit(f"ratelimit:login:ip:{request.remote_addr}",
+                                    *LOGIN_LIMIT_PER_IP)
+    if not allowed:
+        return _too_many_attempts(retry)
+
+    username_limit_key = f"ratelimit:login:user:{username.strip().lower()}"
+    allowed, retry = hit_rate_limit(username_limit_key, *LOGIN_LIMIT_PER_USERNAME)
+    if not allowed:
+        return _too_many_attempts(retry)
+
     user = User.query.filter_by(username=username).first()
     if user and user.check_password(password):
+        # A successful login clears the username counter, so a user who
+        # mistyped a few times is not left close to the lockout threshold.
+        reset_rate_limit(username_limit_key)
+
         # Force logout any existing session first
         if current_user.is_authenticated:
             logout_user()
@@ -685,7 +785,20 @@ def logout():
 
 @app.route('/request-reset', methods=['POST'])
 def request_reset():
-    email = request.json.get('email', '')
+    email = (request.json or {}).get('email', '')
+
+    # Without a limit this endpoint can flood an inbox with reset mails. The
+    # per-email limit applies whether or not the address exists, so the 429
+    # reveals nothing about which e-mails are registered.
+    allowed, retry = hit_rate_limit(f"ratelimit:reset:ip:{request.remote_addr}",
+                                    *RESET_LIMIT_PER_IP)
+    if not allowed:
+        return _too_many_attempts(retry)
+    allowed, retry = hit_rate_limit(f"ratelimit:reset:email:{email.strip().lower()}",
+                                    *RESET_LIMIT_PER_EMAIL)
+    if not allowed:
+        return _too_many_attempts(retry)
+
     user  = User.query.filter_by(email=email).first()
     if user:
         tok = generate_reset_token(user)
