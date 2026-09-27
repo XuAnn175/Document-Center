@@ -50,6 +50,10 @@ services:
       # PYTHONPATH points at the PARENT directory of backend/
       - FLASK_APP=backend.app
       - PYTHONPATH=/app
+      - REDIS_URL=redis://redis:6379/0
+      # Proxies in front of the backend that append to X-Forwarded-For:
+      # just the frontend nginx here. See TRUSTED_PROXY_COUNT in config.py.
+      - TRUSTED_PROXY_COUNT=1
     # Development deliberately keeps the Flask dev server: --debug enables hot
     # reload, which pairs with the bind mount above. Production uses the
     # Dockerfile CMD (gunicorn). Array form avoids wrapping in an extra shell.
@@ -57,6 +61,22 @@ services:
     depends_on:
       mysql:
         condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  redis:
+    image: redis:7.4-alpine
+    container_name: redis
+    # Holds only disposable data (cache entries and rate-limit counters), so
+    # persistence is off: a restart just means a cold cache and reset counters.
+    # allkeys-lru evicts the least recently used keys if memory fills up.
+    command: ["redis-server", "--save", "", "--appendonly", "no",
+              "--maxmemory", "100mb", "--maxmemory-policy", "allkeys-lru"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
 
   frontend:
     build: ./frontend

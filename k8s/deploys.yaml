@@ -68,6 +68,62 @@ spec:
             storage: 5Gi
 ---
 # ----------------------------- #
+# Deployment: Redis             #
+# ----------------------------- #
+# Cache entries and rate-limit counters only -- nothing that must survive a
+# restart -- so a Deployment with persistence off rather than a StatefulSet.
+# The backend fails open if Redis is unreachable: rate limits stop applying
+# and reads fall through to MySQL.
+#
+# For production this also needs requirepass/ACLs and a NetworkPolicy that
+# admits only the backend; as deployed here any Pod in the namespace can
+# reach it.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: redis }
+  template:
+    metadata:
+      labels: { app: redis }
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 999          # the image's redis user (uid 999, gid 1000)
+        runAsGroup: 1000
+        fsGroup: 1000
+      containers:
+      - name: redis
+        image: redis:7.4-alpine
+        args: ["--save", "", "--appendonly", "no",
+               "--maxmemory", "100mb", "--maxmemory-policy", "allkeys-lru"]
+        ports:
+          - containerPort: 6379
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities: { drop: ["ALL"] }
+        resources:
+          requests: { cpu: 50m,  memory: 64Mi }
+          limits:   { cpu: 200m, memory: 160Mi }   # headroom above maxmemory
+        readinessProbe:
+          exec: { command: ["redis-cli", "ping"] }
+          initialDelaySeconds: 3
+          periodSeconds: 5
+        livenessProbe:
+          tcpSocket: { port: 6379 }
+          initialDelaySeconds: 10
+          periodSeconds: 20
+        volumeMounts:
+          - name: data
+            mountPath: /data
+      volumes:
+        - name: data
+          emptyDir: {}
+---
+# ----------------------------- #
 # Deployment: Backend (Flask)   #
 # ----------------------------- #
 apiVersion: apps/v1
@@ -139,6 +195,16 @@ spec:
             value: "80"
           - name: GOOGLE_REDIRECT_URI
             value: "http://localhost/api/auth/google/callback"
+          - name: REDIS_URL
+            value: "redis://redis:6379/0"
+          # Proxies that append to X-Forwarded-For before the backend: the
+          # ingress controller and the frontend nginx. If this is wrong, rate
+          # limits key on a proxy's address and one client can lock everyone
+          # out. Note that k3d's service load balancer may SNAT traffic, in
+          # which case the "client" address seen here is a cluster-internal
+          # one; externalTrafficPolicy: Local preserves the real source IP.
+          - name: TRUSTED_PROXY_COUNT
+            value: "2"
         securityContext:
           allowPrivilegeEscalation: false
           capabilities: { drop: ["ALL"] }
