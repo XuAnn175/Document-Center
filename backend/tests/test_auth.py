@@ -5,7 +5,7 @@ def test_health(client):
     assert rv.status_code == 200
     assert rv.get_json()["message"] == "Flask backend is running."
 
-def test_register_login_logout(client):
+def test_register_login_logout(client, app):
     rv = client.post("/register", json={
         "username": "alice",
         "email": "alice@mail.com",
@@ -23,8 +23,9 @@ def test_register_login_logout(client):
     assert data["message"] == "Login successful"
     assert data["user"]["username"] == "alice"
 
-    uid = load_user(rv.get_json()["user"]["id"])
-    assert uid.username == "alice"
+    with app.app_context():
+        uid = load_user(rv.get_json()["user"]["id"])
+        assert uid.username == "alice"
 
     # get session status
     rv = client.get("/session-status")

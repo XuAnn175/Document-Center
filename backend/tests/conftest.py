@@ -17,9 +17,16 @@ def flask_app():
         UPLOAD_FOLDER=tmp_dir,
         WTF_CSRF_ENABLED=False,
     )
+    # Create the schema, then release the application context. Keeping one
+    # pushed for the whole session made every request reuse it, so Flask's g
+    # and the SQLAlchemy session were shared across requests instead of being
+    # fresh per request as in production. That hid per-request behaviour:
+    # Flask-Login caches the logged-in user on g, so after the first login
+    # user_loader was never called again.
     with real_app.app_context():
         db.create_all()
-        yield real_app
+    yield real_app
+    with real_app.app_context():
         db.session.remove()
         db.drop_all()
     shutil.rmtree(tmp_dir)
@@ -32,3 +39,18 @@ def app(flask_app):
 @pytest.fixture
 def client(app):
     return app.test_client()
+
+
+@pytest.fixture(autouse=True)
+def _push_request_context():
+    """Disable pytest-flask's fixture of the same name.
+
+    pytest-flask pushes one request context for the whole of each test, and
+    every test-client request then reuses its application context instead of
+    getting a fresh one as in production. Flask-Login caches the logged-in
+    user on g, so user_loader ran once per test rather than once per request,
+    and anything per-request (the user cache included) went untested while
+    the tests still passed.
+    """
+    yield
+
